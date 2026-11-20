@@ -11,6 +11,7 @@ const libfx_hooks = @import("libfx_hooks.zig");
 const acp_types = @import("types.zig");
 const mcp_servers = @import("mcp_servers.zig");
 const client_instructions = @import("client_instructions.zig");
+const memory_agent = @import("memory_agent.zig");
 const tool_call_identities = @import("tool_call_identities.zig");
 const workspace_binding = @import("workspace_binding.zig");
 const server = @import("server.zig");
@@ -392,14 +393,23 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         else => return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Invalid hooks" }),
     };
     // Validate the client system prompt before any session side effect.
-    var client_system_prompt = client_instructions.parse(alloc, msg.params_raw) catch |err| switch (err) {
+    const parsed_client_prompt = client_instructions.parseWithMode(alloc, msg.params_raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = client_instructions.parseErrorMessage(err),
         }),
     };
+    var client_system_prompt: ?[]u8 = if (parsed_client_prompt) |p| p.text else null;
+    const client_system_prompt_mode: client_instructions.Mode = if (parsed_client_prompt) |p| p.mode else .append;
     defer if (client_system_prompt) |text| alloc.free(text);
+    const session_memory_agent = memory_agent.parse(alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidMemoryAgent => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = memory_agent.invalid_message,
+        }),
+    };
     var workspace = workspace_binding.prepare(state, alloc, msg.params_raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return state.writer.writeError(alloc, msg.id, .{
@@ -459,6 +469,8 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         .mcp_host = session_host,
         .workspace = if (workspace) |*binding| binding else null,
         .client_system_prompt = &client_system_prompt,
+        .client_system_prompt_mode = client_system_prompt_mode,
+        .memory_agent = session_memory_agent,
     });
 }
 
@@ -472,6 +484,8 @@ const V2Start = struct {
     /// Owned by the caller. The session takes the text over on success, and
     /// this is then set to null.
     client_system_prompt: *?[]u8,
+    client_system_prompt_mode: client_instructions.Mode = .append,
+    memory_agent: memory_agent.Name = .{},
 };
 
 /// `session/new` on v2. The session stays in memory until its first prompt,
@@ -503,7 +517,9 @@ fn startV2Session(
     var v2_owned = true;
     defer if (v2_owned) v2.close();
     if (start.client_system_prompt.*) |text| {
-        v2.setClientPrompt(text) catch |err| {
+        const encoded = try client_instructions.encodePersisted(alloc, text, start.client_system_prompt_mode);
+        defer alloc.free(encoded);
+        v2.setClientPrompt(encoded) catch |err| {
             debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
             return state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.internal_error,
@@ -533,6 +549,8 @@ fn startV2Session(
         .session_rt = session_rt,
         .mcp_host = session_host,
         .client_system_prompt = start.client_system_prompt.*,
+        .client_system_prompt_mode = start.client_system_prompt_mode,
+        .memory_agent = start.memory_agent,
         .workspace = start.workspace,
     }) catch
         return state.writer.writeError(alloc, msg.id, .{
@@ -783,6 +801,24 @@ fn handleRestoreSession(
         }
         return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_params, .message = "Missing sessionId" });
     };
+    const session_memory_agent = memory_agent.parse(alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidMemoryAgent => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = memory_agent.invalid_message,
+        }),
+    };
+    // A client may send its current system prompt again on a load or resume:
+    // its instructions can change while the session sleeps, and the session
+    // then keeps the new ones.
+    var requested_prompt = client_instructions.parseWithMode(state.alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = client_instructions.parseErrorMessage(err),
+        }),
+    };
+    defer if (requested_prompt) |p| p.deinit(state.alloc);
 
     var workspace = workspace_binding.prepare(state, alloc, msg.params_raw) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -917,13 +953,26 @@ fn handleRestoreSession(
     // Read before the active session is released, so an unreadable prompt
     // fails this restore without replacing a different active session. A
     // same-session `cwd` rebind has already released it above.
-    var client_system_prompt: ?[]u8 = restoredClientSystemPrompt(state.alloc, v2.?) catch |err| switch (err) {
+    const restored_prompt = if (requested_prompt) |p| blk: {
+        const encoded = try client_instructions.encodePersisted(alloc, p.text, p.mode);
+        defer alloc.free(encoded);
+        v2.?.setClientPrompt(encoded) catch |err| {
+            debug_trace.logf("acp", "failed to persist client system prompt err={s}", .{@errorName(err)});
+            return state.writer.writeError(alloc, msg.id, .{
+                .code = ErrorCode.internal_error,
+                .message = "Failed to save the client system prompt",
+            });
+        };
+        requested_prompt = null;
+        break :blk p;
+    } else restoredClientSystemPrompt(state.alloc, v2.?) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ClientSystemPromptUnreadable => return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.internal_error,
             .message = "Session client system prompt could not be restored",
         }),
     };
+    var client_system_prompt: ?[]u8 = if (restored_prompt.text.len > 0) restored_prompt.text else null;
     defer if (client_system_prompt) |text| state.alloc.free(text);
     // The session's downloads are its blobs (D44).
     session_rt.configureWebFetchArtifactBlobs(alloc, try v2.?.childCapability(), v2.?.id());
@@ -940,6 +989,8 @@ fn handleRestoreSession(
         .session_rt = session_rt,
         .mcp_host = session_host,
         .client_system_prompt = client_system_prompt,
+        .client_system_prompt_mode = restored_prompt.mode,
+        .memory_agent = session_memory_agent,
         .workspace = if (workspace) |*binding| binding else null,
     }) catch
         return state.writer.writeError(alloc, msg.id, .{
@@ -1273,6 +1324,8 @@ const SessionActivation = struct {
     /// Owned client prompt. The session takes it over on success; the caller
     /// frees it when activation fails.
     client_system_prompt: ?[]u8 = null,
+    client_system_prompt_mode: client_instructions.Mode = .append,
+    memory_agent: memory_agent.Name = .{},
     /// Workspace named by the request's `cwd`, installed once the previous
     /// session is released. Left empty after a successful activation.
     workspace: ?*workspace_binding.Binding = null,
@@ -1285,7 +1338,7 @@ const SessionActivation = struct {
 fn restoredClientSystemPrompt(
     alloc: Allocator,
     session: *session_adapter.Session,
-) error{ OutOfMemory, ClientSystemPromptUnreadable }![]u8 {
+) error{ OutOfMemory, ClientSystemPromptUnreadable }!client_instructions.Parsed {
     const text = session.clientPrompt(alloc) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => {
@@ -1297,7 +1350,9 @@ fn restoredClientSystemPrompt(
             return error.ClientSystemPromptUnreadable;
         },
     };
-    return text orelse &.{};
+    const raw = text orelse return .{ .text = &.{}, .mode = .append };
+    defer alloc.free(raw);
+    return try client_instructions.decodePersisted(alloc, raw);
 }
 
 /// Returns the tool identity record of a restored session. A record that
@@ -1338,6 +1393,8 @@ fn activateSession(state: *server.ServerState, activation: SessionActivation) !v
         .session_id = activation.session_id,
         .v2 = activation.v2,
         .client_system_prompt = client_system_prompt,
+        .client_system_prompt_mode = activation.client_system_prompt_mode,
+        .memory_agent = activation.memory_agent,
         .tool_identities = tool_identities,
         .model = activation.model,
         .provider = activation.provider,

@@ -766,6 +766,8 @@ fn appendRuntimeContext(raw: *anyopaque, arena: Allocator, messages: *std.ArrayL
         .access_scope = tool_ctx.access_scope,
         .interactive = false,
         .permission_mode = context.admission.permission_mode,
+        .memory_agent_name = tool_ctx.memory_agent_name,
+        .memories = tool_ctx.tool_registry.lookup("memories") != null,
     }, arena, messages);
 }
 

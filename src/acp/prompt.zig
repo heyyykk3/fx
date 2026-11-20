@@ -669,6 +669,7 @@ const AcpContext = struct {
             .auto_classifier = self.auto_classifier,
             .subagent_host = self.state.subagent_host,
             .subagent_caller_id = session.session_id,
+            .memory_agent_name = session.memory_agent.slice(),
             .worker = &self.state.worker,
             .permission_prompter = if (self.state.initialized) .{
                 .observer = self.observer,
@@ -1341,11 +1342,14 @@ pub fn handlePrompt(
 
     var skill_catalog = state.skills.acquireCatalog();
     defer skill_catalog.deinit();
-    const host_instructions = try client_instructions.compose(
-        alloc,
-        state.host_instructions,
-        session.client_system_prompt,
-    );
+    const host_instructions = if (session.client_system_prompt_mode == .replace and session.client_system_prompt.len > 0)
+        try alloc.dupe(u8, state.host_instructions)
+    else
+        try client_instructions.compose(
+            alloc,
+            state.host_instructions,
+            session.client_system_prompt,
+        );
     defer alloc.free(host_instructions);
     for (state.context_snapshot.notices) |notice| try pushContextNotice(@ptrCast(&ctx), notice);
 
@@ -1590,7 +1594,19 @@ pub fn runSubagentChild(
         state.subagent_authority_mutex.unlock(io_mod.getIo());
         return err;
     };
+    // A host that replaced fx's system prompt replaced it for the session's
+    // subagents too; they start from a copy, since the session owns it.
+    const replaced_prompt: ?[]u8 = if (active.client_system_prompt_mode == .replace and active.client_system_prompt.len > 0)
+        alloc.dupe(u8, active.client_system_prompt) catch |err| {
+            project_context.deinit(alloc);
+            route.deinit(alloc);
+            state.subagent_authority_mutex.unlock(io_mod.getIo());
+            return err;
+        }
+    else
+        null;
     state.subagent_authority_mutex.unlock(io_mod.getIo());
+    defer if (replaced_prompt) |text| alloc.free(text);
     defer route.deinit(alloc);
     defer project_context.deinit(alloc);
     var ctx = AcpContext{
@@ -1631,7 +1647,7 @@ pub fn runSubagentChild(
         .host = subagent_host,
         .tool_context = ctx.toolContext(),
         .provider_set = state.cfg.provider_set,
-        .system_prompt = state.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
+        .system_prompt = replaced_prompt orelse state.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(admission.model),
         .skill_catalog = .{ .skills = skill_catalog.items, .diagnostics = skill_catalog.diagnostics },
         .advertised_tool_names = child_projection.advertised_names,
@@ -1714,8 +1730,12 @@ fn buildAgentConfig(
     session: *server.ActiveSessionState,
     sections: AgentConfigSections,
 ) agent_runtime.Config {
+    const system_prompt = if (session.client_system_prompt_mode == .replace and session.client_system_prompt.len > 0)
+        session.client_system_prompt
+    else
+        state.cfg.prompt_policy.systemPromptFor(state.terminal_ui);
     return .{
-        .system_prompt = state.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
+        .system_prompt = system_prompt,
         .host_instructions = sections.host_instructions,
         .model_prompt_overlay = state.cfg.prompt_policy.modelPromptOverlay(session.model),
         .skill_catalog = sections.skill_catalog,
@@ -2623,6 +2643,8 @@ fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.Ar
         // ACP's turns have no id here, so its list is read afresh at each
         // step; its reports never join a turn, so a change shows at once.
         .subagents = if (ctx.state.subagent_host) |team_host| try team_host.teamNote(arena, 0) else null,
+        .memory_agent_name = session.memory_agent.slice(),
+        .memories = activeToolSet(ctx.state).registry.lookup("memories") != null,
     }, arena, messages);
 }
 

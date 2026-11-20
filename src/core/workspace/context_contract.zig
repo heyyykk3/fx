@@ -370,6 +370,10 @@ pub const TransientContextInput = struct {
     /// host (`Runtime.teamNote` in src/core/subagent/tool_host.zig); null
     /// when it has none.
     subagents: ?[]const u8 = null,
+    /// The agent whose saved notes join the context.
+    memory_agent_name: []const u8 = "main",
+    /// Whether the agent has the memories tool; without it, no notes join.
+    memories: bool = true,
 };
 
 pub const Provider = struct {

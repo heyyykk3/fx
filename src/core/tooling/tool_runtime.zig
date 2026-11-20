@@ -251,6 +251,8 @@ pub const Context = struct {
     advertised_dynamic_tool_names: []const []const u8 = &.{},
     /// The built-in tools this agent offers through toolbox.
     toolbox_behind: []const []const u8 = &.{},
+    /// The agent whose saved notes the memories tool reads and writes.
+    memory_agent_name: []const u8 = "main",
     /// The MCP servers the toolbox menu lists.
     toolbox_mcp_servers: []const []const u8 = &.{},
     permission_reviewer_provider: ?permission_auto_classifier.Provider = null,
@@ -1924,6 +1926,7 @@ fn typedDispatchContext(ctx: Context, arena: Allocator) tool_dispatch.DispatchCo
         .skill_locations = ctx.skill_locations,
         .toolbox_mcp_servers = ctx.toolbox_mcp_servers,
         .toolbox_behind = ctx.toolbox_behind,
+        .memory_agent_name = ctx.memory_agent_name,
         .context_limits = ctx.context_limits,
         .ignored_list_entries = ctx.ignored_list_entries,
         .max_list_entries = ctx.max_list_entries,

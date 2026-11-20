@@ -108,13 +108,16 @@ fn toolRequiresApproval(input: Input, name: []const u8) bool {
     return if (registeredTool(input, name)) |spec| spec.requires_approval else false;
 }
 
-fn registeredTerminalCallReadsOnly(
+/// Whether `call` is to a registered tool of `kind` and its decoded input
+/// only reads. False when it fails to decode or validate.
+fn registeredCallReadsOnly(
     input: Input,
     arena: Allocator,
     call: ToolCall,
+    kind: tool_dispatch.ExecutorKind,
 ) !bool {
     const tool = registeredTool(input, call.name) orelse return false;
-    if (tool.executor_kind != .terminal) return false;
+    if (tool.executor_kind != kind) return false;
     const decode_ctx = tool_dispatch.DispatchContext{
         .allocator = arena,
         .workspace_root = input.workspace_root,
@@ -1274,7 +1277,15 @@ fn resolveOrdinaryPermissionOutcome(
     if (permission_mode == .auto and
         !command_call and
         !is_dynamic_tool and
-        try registeredTerminalCallReadsOnly(input, arena, call))
+        try registeredCallReadsOnly(input, arena, call, .terminal))
+    {
+        return ordinaryPermissionOutcome(.once);
+    }
+    // Searching or listing saved notes changes nothing, in any mode; saving,
+    // updating, or forgetting one is a write and is asked for or reviewed.
+    if (!command_call and
+        !is_dynamic_tool and
+        try registeredCallReadsOnly(input, arena, call, .memory))
     {
         return ordinaryPermissionOutcome(.once);
     }
@@ -4705,6 +4716,45 @@ test "ask-only policy bypasses prompt and reviewer in auto and uses the ordinary
     try std.testing.expect(denied.execution_authority == null);
     try std.testing.expectEqual(@as(usize, 0), fake.calls);
     try std.testing.expectEqual(@as(usize, 2), recording.calls);
+}
+
+test "memories reads run without approval while saving a note is asked for" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var worker: WorkerRuntime = .{};
+    defer worker.deinit(std.testing.allocator);
+    var fake = FakeAutoClassifier{};
+    var recording = RecordingPrompter{};
+    var input = testInputWithClassifier(
+        &worker,
+        permission_auto_classifier.Classifier.withOverride(
+            @ptrCast(&fake),
+            FakeAutoClassifier.classify,
+        ),
+    );
+    const tools = [_]tool_dispatch.Tool{test_builtin_tools.memories};
+    input.tool_registry = .{ .tools = tools[0..] };
+    input.permission_prompter = recording.prompter();
+
+    for ([_]PermissionMode{ .ask, .auto }) |mode| {
+        const search = try requestPermissionOutcome(input, arena_state.allocator(), .{
+            .id = "memories-search",
+            .name = "memories",
+            .arguments_json = "{\"action\":\"search\",\"query\":\"deploy\"}",
+        }, mode, &.{});
+        try std.testing.expectEqual(ToolPermissionDecision.once, search.decision);
+    }
+    try std.testing.expectEqual(@as(usize, 0), recording.calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+
+    recording.decision = .deny;
+    const save = try requestPermissionOutcome(input, arena_state.allocator(), .{
+        .id = "memories-save",
+        .name = "memories",
+        .arguments_json = "{\"action\":\"save\",\"content\":\"Run every task as a bot\"}",
+    }, .ask, &.{});
+    try std.testing.expectEqual(ToolPermissionDecision.deny, save.decision);
+    try std.testing.expectEqual(@as(usize, 1), recording.calls);
 }
 
 test "automatic terminal admission reviews only sensitive typed input" {

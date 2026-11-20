@@ -405,11 +405,20 @@ fn appendConfiguredSkillRoots(
     if (root_policy.managed_root_source) |source| {
         try appendDupeRoot(alloc, roots, source, skills_dir);
     }
-    if (home) |home_root| {
+    if (home) |home_root| if (globalCompatRootsEnabled()) {
         for (root_policy.global_roots) |spec| {
             try appendSpecRoot(alloc, roots, home_root, spec);
         }
-    }
+    };
+}
+
+/// Whether fx reads other agents' skill folders in the home folder
+/// (`~/.claude/skills`, `~/.agents/skills`, ...). A host that hands fx its
+/// own skills, in the workspace and in fx's folder, sets
+/// `FX_SKILL_GLOBAL_COMPAT=0` so the person's own installs stay theirs.
+fn globalCompatRootsEnabled() bool {
+    const raw = io_mod.getenv("FX_SKILL_GLOBAL_COMPAT") orelse return true;
+    return !(std.mem.eql(u8, raw, "0") or std.ascii.eqlIgnoreCase(raw, "false") or std.ascii.eqlIgnoreCase(raw, "off"));
 }
 
 fn collectRootFingerprints(
@@ -6139,6 +6148,37 @@ const TestEnviron = struct {
         alloc.destroy(self);
     }
 };
+
+test "FX_SKILL_GLOBAL_COMPAT=0 leaves other agents' home skill folders out and keeps the workspace's and fx's own" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTempFile(&tmp, "home/workspace/.agents/skills/shared/SKILL.md", "---\nname: shared\ndescription: from the host\n---\n\nbody\n");
+    try writeTempFile(&tmp, "home/.fx/skills/installed/SKILL.md", "---\nname: installed\ndescription: installed in fx\n---\n\nbody\n");
+    try writeTempFile(&tmp, "home/.claude/skills/personal/SKILL.md", "---\nname: personal\ndescription: the person's own\n---\n\nbody\n");
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/workspace");
+    defer alloc.free(workspace_root);
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const managed = try std.Io.Dir.path.join(alloc, &.{ home_root, ".fx/skills" });
+    defer alloc.free(managed);
+    const workspace_roots = [_]skill_contract.RootSpec{.{ .source = .workspace_agents, .path = ".agents/skills" }};
+    const global_roots = [_]skill_contract.RootSpec{.{ .source = .global_claude, .path = ".claude/skills" }};
+    const policy: skill_contract.RootPolicy = .{ .workspace_roots = &workspace_roots, .managed_root_source = .global_fx, .global_roots = &global_roots };
+
+    const env = try TestEnviron.install(alloc);
+    defer env.deinit();
+    try env.put("FX_SKILL_GLOBAL_COMPAT", "0");
+    var discovery = try loadVisibleSkills(alloc, workspace_root, home_root, managed, policy);
+    defer discovery.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), discovery.skills.len);
+    for (discovery.skills) |skill| try std.testing.expect(skill.source != .global_claude);
+
+    try env.put("FX_SKILL_GLOBAL_COMPAT", "1");
+    var all = try loadVisibleSkills(alloc, workspace_root, home_root, managed, policy);
+    defer all.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), all.skills.len);
+}
 
 test "externalSymlinkAuthorities parses colon-separated absolute paths" {
     const alloc = std.testing.allocator;

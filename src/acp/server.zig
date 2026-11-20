@@ -7,6 +7,8 @@ const io_mod = @import("../core/shared/io.zig");
 const host_target = @import("../core/hosts/target.zig");
 const jsonrpc = @import("jsonrpc.zig");
 const acp_types = @import("types.zig");
+const client_instructions = @import("client_instructions.zig");
+const memory_agent = @import("memory_agent.zig");
 const sessions = @import("sessions.zig");
 const prompt_handler = @import("prompt.zig");
 const prompt_test_controls = @import("prompt_test_controls.zig");
@@ -15,6 +17,7 @@ const app_runtime_setup = @import("../core/app/app_runtime_setup.zig");
 const compactor = @import("../core/compactor/compactor.zig");
 const builtin_skills = @import("../builtins/skills.zig");
 const builtin_tools = @import("../builtins/tools.zig");
+const tool_set_contract = @import("../core/tooling/tool_set.zig");
 const credentials = @import("../core/auth/credentials.zig");
 const secret = @import("../core/auth/secret.zig");
 const auth_runtime = @import("../core/auth/auth_runtime.zig");
@@ -269,6 +272,9 @@ pub const ActiveSessionState = struct {
     /// Session-scoped client system prompt, appended after fx's instructions.
     /// Owned by the server allocator; empty when the client supplied none.
     client_system_prompt: []u8 = &.{},
+    client_system_prompt_mode: client_instructions.Mode = .append,
+    /// The agent whose saved notes this session reads and writes.
+    memory_agent: memory_agent.Name = .{},
     /// MCP identities shown for earlier tool calls, for session/load replay.
     tool_identities: tool_call_identities.Record = .{},
     cancel_flag: std.atomic.Value(bool),
@@ -404,6 +410,9 @@ pub const ServerState = struct {
     lifecycle_runtime: hooks.Runtime = hooks.Runtime.init(std.heap.c_allocator),
     lifecycle_view: hooks.RuntimeView = hooks.RuntimeView.empty(),
     host_tools: host_tool_runtime.Runtime = .{},
+    /// fx's own tools this server offers: all of them, less any the launch
+    /// removed with `FX_WITHOUT_TOOLS` (`withoutTools`).
+    native_tools: tool_set_contract.ToolSet = builtin_tools.advertisement_set,
     host_instructions: []u8 = &.{},
     outbound_mutex: std.Io.Mutex = .init,
     outbound_cond: std.Io.Condition = .init,
@@ -1133,6 +1142,38 @@ pub fn run(alloc: Allocator, cfg: Config) !void {
     return runWithTransport(alloc, cfg, jsonrpc.Reader.init(), jsonrpc.Writer.init());
 }
 
+/// `base` less the tools `names` lists, comma-separated: a host that keeps
+/// some of fx's work itself (dusk bot: its own memory and skill library)
+/// removes fx's tools for it. A removed tool is never offered, and a call to
+/// it is refused as unknown. Unknown names are ignored. Belongs to `arena`.
+pub fn withoutTools(arena: Allocator, base: tool_set_contract.ToolSet, names: ?[]const u8) !tool_set_contract.ToolSet {
+    const raw = names orelse return base;
+    const Keep = struct {
+        raw: []const u8,
+        pub fn allows(self: @This(), name: []const u8) bool {
+            var parts = std.mem.splitScalar(u8, self.raw, ',');
+            while (parts.next()) |part| {
+                if (std.mem.eql(u8, std.mem.trim(u8, part, " \t"), name)) return false;
+            }
+            return true;
+        }
+    };
+    return (try tool_set_contract.narrow(arena, base, Keep{ .raw = raw })) orelse base;
+}
+
+test "FX_WITHOUT_TOOLS removes the named built-in tools and nothing else" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const narrowed = try withoutTools(arena.allocator(), builtin_tools.advertisement_set, "memories, install_skill,not_a_tool");
+    try std.testing.expect(narrowed.registry.lookup("memories") == null);
+    try std.testing.expect(narrowed.registry.lookup("install_skill") == null);
+    try std.testing.expect(narrowed.registry.lookup("read_file") != null);
+    for (narrowed.order) |name| try std.testing.expect(!std.mem.eql(u8, name, "memories"));
+    try std.testing.expectEqual(builtin_tools.advertisement_set.registry.tools.len - 2, narrowed.registry.tools.len);
+    const unchanged = try withoutTools(arena.allocator(), builtin_tools.advertisement_set, null);
+    try std.testing.expectEqual(builtin_tools.advertisement_set.registry.tools.len, unchanged.registry.tools.len);
+}
+
 pub fn runWithTransport(
     alloc: Allocator,
     cfg: Config,
@@ -1142,12 +1183,16 @@ pub fn runWithTransport(
     if (cfg.log_file) |path| {
         try debug_trace.configure(.{ .file_path = path });
     }
+    var native_tools_arena = std.heap.ArenaAllocator.init(alloc);
+    defer native_tools_arena.deinit();
+    const native_tools = try withoutTools(native_tools_arena.allocator(), builtin_tools.advertisement_set, io_mod.getenv("FX_WITHOUT_TOOLS"));
 
     var lifecycle_runtime = hooks.Runtime.init(alloc);
     const lifecycle_view = lifecycle_runtime.freeze();
     var state = ServerState{
         .alloc = alloc,
         .cfg = cfg,
+        .native_tools = native_tools,
         .writer = writer_value,
         .web_search_runtime = web_search_runtime.Runtime.init(.{
             .provider = cfg.provider_set.gateway.fx_search,
@@ -3158,6 +3203,15 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.configured_providers = startup.configured_providers;
     startup.configured_providers = .{};
     state.cfg.provider_set.definitions = state.configured_providers.definitions;
+    // A provider named at launch is bound to its settings entry here, so its
+    // first session routes to it; one settings doesn't define stops here.
+    if (state.provider == .configured) {
+        state.provider = state.provider.bind(state.configured_providers) catch {
+            const message = try std.fmt.allocPrint(alloc, "Provider '{s}' is not defined in settings.json providers", .{state.provider.label()});
+            defer alloc.free(message);
+            return state.writer.writeError(alloc, msg.id, .{ .code = ErrorCode.invalid_request, .message = message });
+        };
+    }
     state.gateway_source_preference = startup.credential_source_preference;
     state.configured_model = try alloc.dupe(u8, startup.configured_model);
 

@@ -25,6 +25,7 @@ const read_tool_result_impl = @import("../tools/session/read_tool_result.zig");
 const shell_impl = @import("../tools/shell/shell.zig");
 const install_skill_impl = @import("../tools/skills/install_skill.zig");
 const toolbox_impl = @import("../tools/capabilities/toolbox.zig");
+const memory_impl = @import("../tools/memory/memory.zig");
 const web_fetch_impl = @import("../tools/web/fetch.zig");
 const web_search_impl = @import("../tools/web/search.zig");
 
@@ -672,6 +673,54 @@ pub const read_tool_result = ToolSpec{
     .irreversible_fn = read_tool_result_impl.isIrreversible,
 };
 
+const memory_description =
+    "Notes that last across conversations. action=save stores a durable fact, preference, decision, or procedure (never a secret); action=search recalls notes by query; action=list shows a scope; action=update replaces a note by id and keeps the old one as history; action=forget archives a note by id. Scope agent (the default) is this agent's own notes, user is about the user, workspace is about this folder, shared is for every agent.";
+
+const memory_properties = [_]model_tool_schema.Property{
+    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "save", "search", "list", "update", "forget" } } },
+    .{ .name = "scope", .json_type = .string, .shape = &.{ .enum_values = &.{ "user", "agent", "workspace", "shared" } }, .description = "Where the note lives. Save defaults to agent; search and list read every scope when omitted." },
+    .{ .name = "kind", .json_type = .string, .shape = &.{ .enum_values = &.{ "fact", "preference", "decision", "procedure", "entity", "episodic" } }, .description = "Category of memory entry." },
+    .{ .name = "id", .json_type = .string, .description = "For update and forget: the memory id." },
+    .{ .name = "title", .json_type = .string, .description = "Short label for save or update." },
+    .{ .name = "content", .json_type = .string, .description = "For save and update: the memory text to store." },
+    .{ .name = "query", .json_type = .string, .description = "For search: keywords or phrase to recall." },
+    .{ .name = "tags", .json_type = .array, .shape = &.{ .array_values = .{ .json_type = .string } }, .description = "Optional tags for save or update." },
+    .{ .name = "importance", .json_type = .integer, .description = "Optional priority from 1 to 5 (default 3)." },
+    .{ .name = "limit", .json_type = .integer, .description = "Max results for search/list (1 to 50, default 10)." },
+    .{ .name = "reason", .json_type = .string, .description = "Optional reason when archiving via forget." },
+};
+
+pub const memories = ToolSpec{
+    .name = "memories",
+    .description = memory_description,
+    .model_schema = .{
+        .name = "memories",
+        .description = memory_description,
+        .input_schema = .{
+            .properties = &memory_properties,
+            .required = &.{"action"},
+            .additional_properties = false,
+        },
+    },
+    .executor_kind = .memory,
+    .activity_kind = .read,
+    // Saving, updating, and forgetting are writes, admitted like any other;
+    // searching and listing only read (see tool_admission).
+    .requires_approval = true,
+    // An approval names the note being saved or replaced, so the person sees what is written.
+    .action_label = "Saving note",
+    .completed_action_label = "Saved note",
+    .label_arg_kind = .content,
+    .label_arg_default = "note",
+    .presentation_fn = memory_impl.presentation,
+    .permission_target_kind = .none,
+    .decode = memory_impl.decode,
+    .validate = memory_impl.validate,
+    .call = memory_impl.call,
+    .reads_only_fn = memory_impl.readsOnly,
+    .irreversible_fn = memory_impl.isIrreversible,
+};
+
 pub const all = [_]tool_dispatch.Tool{
     glob_files,
     grep_files,
@@ -687,6 +736,7 @@ pub const all = [_]tool_dispatch.Tool{
     vision,
     read_tool_result,
     toolbox,
+    memories,
 };
 
 /// fx's own tools. libfx's Node-API addon never runs them, because its agents
@@ -773,6 +823,7 @@ pub const advertisement_order = [_][]const u8{
     "shell",
     "subagent",
     "toolbox",
+    "memories",
     "ask_user_question",
     "web_fetch",
     "web_search",
@@ -847,9 +898,9 @@ test "built-in model-facing tool contract stays byte exact" {
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
         if (builtin.target.os.tag.isDarwin())
-            "a84217167d9345c518d346ab58d3e117b92ac636b5272af02720011c6aa99a99"
+            "c8786c1b3352cd7f50f88f6d6e7fb38b1d2354e0ce2bb1c5710594e1dd132f6c"
         else
-            "8b6048d8bf6145c7a37a2bc376d13d4b2cfae304b179a2bd1d2e464a138d87a1",
+            "5da4cb8d9a6d110a1eb9663962665f09598e60cad8a2433a2d454e71977e5448",
         &actual_hex,
     );
 }
@@ -913,6 +964,7 @@ test "built-in tools register exact active local order" {
         "vision",
         "read_tool_result",
         "toolbox",
+        "memories",
     };
 
     try std.testing.expectEqual(expected_names.len, all.len);
@@ -1045,6 +1097,7 @@ test "built-in tool lookup and metadata use registered defaults" {
     try std.testing.expect(lookup("skill") == null);
     try std.testing.expect(lookup("mcp_select_tool") == null);
     try std.testing.expect(lookup("memory") == null);
+    try std.testing.expect(lookup("memories") != null);
     try std.testing.expect(lookup("skill_search") == null);
     try std.testing.expect(lookup("mcp_search_tools") == null);
     try std.testing.expect(lookup("run_command") == null);

@@ -45,6 +45,11 @@ pub fn build(b: *std.Build) void {
         "sanitize-thread",
         "Build fx and its tests with ThreadSanitizer",
     ) orelse false;
+    const test_filter = b.option(
+        []const u8,
+        "test-filter",
+        "Only run unit tests whose name contains this substring",
+    );
 
     const git_commit = readGitCommit(b);
     const app_version = readAppVersion(b);
@@ -104,6 +109,7 @@ pub fn build(b: *std.Build) void {
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .filters = if (test_filter) |f| &.{f} else &.{},
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     run_exe_tests.step.dependOn(b.getInstallStep());

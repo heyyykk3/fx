@@ -191,7 +191,7 @@ pub fn subagentStreamedAgent(json: []const u8) ?[]const u8 {
 pub fn streamedLabelValue(kind: tool_dispatch.LabelArgKind, json: []const u8) ?[]const u8 {
     return switch (kind) {
         .none, .action, .command, .session_id, .open, .run, .search => null,
-        .name, .path, .pattern, .url, .description, .source, .resource, .query, .server, .selector => streamedStringField(json, @tagName(kind), 1, 1),
+        .name, .path, .pattern, .url, .description, .source, .resource, .query, .server, .selector, .content => streamedStringField(json, @tagName(kind), 1, 1),
     };
 }
 

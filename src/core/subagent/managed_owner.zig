@@ -1794,7 +1794,7 @@ test "an admission that failed for the child's profile names the profile, and an
     // The reason, then what works, and no period of its own: the report that
     // carries it adds one.
     try std.testing.expectEqualStrings(
-        "profile_unavailable: no profile named 'reviewer'. Profiles: agent, main; Restore the profile, or close this subagent and start a new one, which loses its conversation",
+        "profile_unavailable: no profile named 'reviewer'. Profiles: agent, fx-assistant, fx-coder, fx-ops, fx-researcher, fx-reviewer, main; Restore the profile, or close this subagent and start a new one, which loses its conversation",
         named.failure.?.view(),
     );
     try std.testing.expect(!std.mem.endsWith(u8, named.failure.?.view(), "."));

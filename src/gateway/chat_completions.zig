@@ -78,6 +78,7 @@ pub fn build_for(definition: *const definitions.Definition, alloc: Allocator, re
             .output_limit_field = if (metadata) |known| known.output_limit_field orelse .max_tokens else .max_tokens,
             .request_fields = request_fields,
             .effort_fields = level,
+            .dialect = definition.dialect,
         }),
         .@"openai-responses" => responses.build_request(alloc, request, .{
             .tool_choice_mode = definition.tool_choice_mode,
@@ -102,6 +103,12 @@ fn consumer(protocol: definitions.Protocol) transport.ConsumeFn {
         .@"openai-responses" => responses.consume,
         .@"anthropic-messages" => consume_messages,
     };
+}
+
+/// The consumer for `definition`: its protocol's, read in the dialect it declares.
+fn consumerFor(definition: *const definitions.Definition) transport.ConsumeFn {
+    if (definition.protocol == .@"openai-chat-completions" and definition.dialect == .gemini) return consume_gemini;
+    return consumer(definition.protocol);
 }
 
 /// Which replay parts a connection's protocol keeps for a later request.
@@ -177,13 +184,20 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: streams.ModelRequest) !st
     const payload = request.prepared_request_body orelse try build(raw, alloc, request.data());
     defer if (request.prepared_request_body == null) alloc.free(payload);
     const definition = definition_at(raw);
-    return transport.send(alloc, definition, request, payload, consumer(definition.protocol));
+    return transport.send(alloc, definition, request, payload, consumerFor(definition));
 }
 
 /// Parses a successful streamed Chat Completions reply from `reader`,
 /// telling `progress` about each event when it is set.
 pub fn consume(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress) !streams.Result {
     var limits: codec.Limits = .{};
+    if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
+    return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag, progress);
+}
+
+/// The same in the gemini dialect.
+fn consume_gemini(alloc: Allocator, reader: *std.Io.Reader, request: streams.ModelRequest, progress: ?sse.Progress) !streams.Result {
+    var limits: codec.Limits = .{ .dialect = .gemini };
     if (request.content_capture_limit) |limit| limits.content_bytes = @min(limit, limits.content_bytes);
     return codec.consume_stream(alloc, reader, request.data(), limits, request.events, request.cancel_flag, progress);
 }

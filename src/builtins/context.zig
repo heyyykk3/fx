@@ -13,6 +13,7 @@ const types = @import("../core/shared/types.zig");
 const context_contract = @import("../core/workspace/context_contract.zig");
 const context_limits = @import("../core/config/context_limits.zig");
 const prompt_policy_contract = @import("../core/config/prompt_policy.zig");
+const memory_core = @import("../core/memory/memory.zig");
 
 const Allocator = std.mem.Allocator;
 const ChatMessage = types.ChatMessage;
@@ -3763,6 +3764,13 @@ fn appendTransient(input: TransientContextInput, arena: Allocator, messages: *st
         .content = "Runtime context: after changing files, verify with focused checks for the touched paths first; avoid broad or expensive checks unless those paths or the user call for them. Tests under tests/evals can be deterministic. Keep exact verification evidence in the final summary.",
     });
     if (input.subagents) |note| try messages.append(arena, .{ .role = .system, .content = note });
+    if (!input.memories) return;
+    const memory_block = memory_core.renderContextBlock(
+        arena,
+        .{ .workspace_root = input.workspace_root, .agent_name = input.memory_agent_name },
+        memory_core.default_context_max_bytes,
+    ) catch null; // Missing or unreadable memory directory never blocks a turn (R2.3/R3.1).
+    if (memory_block) |block| try messages.append(arena, .{ .role = .system, .content = block });
 }
 
 fn appendWorkspaceAccessContext(

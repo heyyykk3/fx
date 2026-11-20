@@ -32,6 +32,8 @@ pub const Options = struct {
     /// it (`tests/tla/configured_provider/ConfiguredRequest.tla`
     /// EffortOnlyWhenDeclared).
     effort_fields: ?request_fragment.Fragment = null,
+    /// The connection's `dialect` (configured_provider.Dialect).
+    dialect: configured_provider.Dialect = .standard,
 };
 
 pub const Error = error{
@@ -247,6 +249,10 @@ fn validate_history(alloc: Allocator, messages: []const types.ChatMessage) Error
 
 const reasoning_fields = [_][]const u8{ "reasoning", "reasoning_content" };
 const association_field = "_tool_call_ids";
+/// Each associated call's own replay part, in the order of `_tool_call_ids`:
+/// the object the server sent as its `extra_content`, or null. Written back
+/// onto that call, never onto the message. Only the gemini dialect records it.
+const tool_extra_field = "_tool_call_extra";
 
 // The private association list never reaches the wire. Signed/encrypted metadata
 // is indivisible: filtering an associated call must drop the entire sequence.
@@ -280,9 +286,16 @@ fn parse_replay(alloc: Allocator, raw: []const u8) Error!std.json.Parsed(std.jso
                 if (id != .string or id.string.len == 0 or id.string.len > 256) return error.InvalidProviderState;
                 for (value.array.items[0..index]) |prior| if (std.mem.eql(u8, id.string, prior.string)) return error.InvalidProviderState;
             }
+        } else if (std.mem.eql(u8, key, tool_extra_field)) {
+            if (value != .array) return error.InvalidProviderState;
+            for (value.array.items) |item| if (item != .object and item != .null) return error.InvalidProviderState;
+            metadata_seen = true;
         } else return error.InvalidProviderState;
     }
     if (!metadata_seen or !fields.contains(association_field)) return error.InvalidProviderState;
+    if (fields.get(tool_extra_field)) |extras| {
+        if (extras.array.items.len != fields.get(association_field).?.array.items.len) return error.InvalidProviderState;
+    }
     return parsed;
 }
 
@@ -309,7 +322,7 @@ fn write_replay(writer: *std.Io.Writer, alloc: Allocator, message: types.ChatMes
     if (!replay_calls_match(parsed.value.object, message.tool_calls)) return error.InvalidProviderState;
     var fields = parsed.value.object.iterator();
     while (fields.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, association_field)) continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, association_field) or std.mem.eql(u8, entry.key_ptr.*, tool_extra_field)) continue;
         try writer.writeByte(',');
         try std.json.Stringify.value(entry.key_ptr.*, .{}, writer);
         try writer.writeByte(':');
@@ -458,8 +471,28 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
     const verified = request.verified_images orelse &.{};
     const verified_at = if (verified.len != 0) function_tools.last_user_index(request.messages) else null;
     const lanes = [_][]const types.ChatMessage{ request.instructions, request.messages };
+    // Gemini keeps only the last system message it is sent, so in its dialect
+    // every system message goes first, as one, in the order fx wrote them.
+    const merge_system = options.dialect == .gemini;
+    if (merge_system) {
+        var system: std.Io.Writer.Allocating = .init(alloc);
+        defer system.deinit();
+        for (lanes) |lane| for (lane) |message| {
+            if (message.role != .system) continue;
+            const text = message.content orelse continue;
+            if (system.written().len != 0) try system.writer.writeAll("\n\n");
+            try system.writer.writeAll(text);
+        };
+        if (system.written().len != 0) {
+            try writer.writeAll("{\"role\":\"system\",\"content\":");
+            try std.json.Stringify.value(system.written(), .{}, writer);
+            try writer.writeByte('}');
+            count += 1;
+        }
+    }
     for (lanes, 0..) |lane, lane_index| {
         for (lane, 0..) |message, message_index| {
+            if (merge_system and message.role == .system) continue;
             const carries_verified = lane_index == 1 and verified_at == message_index;
             // Source validation rejects empty assistants; only stripped replay can leave one here.
             if (message.role == .assistant and message.content == null and message.tool_calls.len == 0 and message.provider_replay == null) continue;
@@ -480,6 +513,12 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
                 try std.json.Stringify.value(projection.resolve(message.tool_call_id.?), .{}, writer);
             }
             if (message.tool_calls.len != 0) {
+                var replay_parts: ?std.json.Parsed(std.json.Value) = if (message.provider_replay) |replay| try parse_replay(alloc, replay.parts_json) else null;
+                defer if (replay_parts) |*parts| parts.deinit();
+                const extras: []const std.json.Value = if (replay_parts) |parts|
+                    if (parts.value.object.get(tool_extra_field)) |list| list.array.items else &.{}
+                else
+                    &.{};
                 try writer.writeAll(",\"tool_calls\":[");
                 for (message.tool_calls, 0..) |call, index| {
                     if (index != 0) try writer.writeByte(',');
@@ -489,7 +528,12 @@ fn write_request(writer: *std.Io.Writer, alloc: Allocator, request: stream_provi
                     try std.json.Stringify.value(call.name, .{}, writer);
                     try writer.writeAll(",\"arguments\":");
                     try std.json.Stringify.value(call.arguments_json, .{}, writer);
-                    try writer.writeAll("}}");
+                    try writer.writeByte('}');
+                    if (index < extras.len and extras[index] == .object) {
+                        try writer.writeAll(",\"extra_content\":");
+                        try std.json.Stringify.value(extras[index], .{}, writer);
+                    }
+                    try writer.writeByte('}');
                 }
                 try writer.writeByte(']');
             }
@@ -561,6 +605,8 @@ pub const Limits = struct {
     arguments_bytes: usize = 1024 * 1024,
     content_bytes: usize = 8 * 1024 * 1024,
     reasoning_bytes: usize = types.ProviderReplay.max_bytes,
+    /// The connection's `dialect` (configured_provider.Dialect).
+    dialect: configured_provider.Dialect = .standard,
 };
 
 const ReasoningPart = struct {
@@ -577,11 +623,14 @@ const Tool = struct {
     id: ?[]u8 = null,
     name: std.ArrayList(u8) = .empty,
     arguments: std.ArrayList(u8) = .empty,
+    /// The call's `extra_content` as sent, encoded; gemini dialect only.
+    extra: ?[]u8 = null,
 
     fn deinit(self: *Tool, alloc: Allocator) void {
         if (self.id) |id| alloc.free(id);
         self.name.deinit(alloc);
         self.arguments.deinit(alloc);
+        if (self.extra) |extra| alloc.free(extra);
     }
 };
 
@@ -755,7 +804,10 @@ pub const Reducer = struct {
 
     /// Caller owns the bounded replay envelope; accumulators remain reducer-owned.
     fn reasoning_state(self: *const Reducer) (Error || std.Io.Writer.Error)!?[]u8 {
-        if (self.reasoning[0].presence == .absent and self.reasoning[1].presence == .absent and self.reasoning_details.presence == .absent) return null;
+        const has_extra = for (self.tools.items) |tool| {
+            if (tool.extra != null) break true;
+        } else false;
+        if (self.reasoning[0].presence == .absent and self.reasoning[1].presence == .absent and self.reasoning_details.presence == .absent and !has_extra) return null;
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
         try out.writer.writeByte('{');
@@ -783,7 +835,16 @@ pub const Reducer = struct {
             if (index != 0) try out.writer.writeByte(',');
             try std.json.Stringify.value(tool.id.?, .{}, &out.writer);
         }
-        try out.writer.writeAll("]}");
+        try out.writer.writeByte(']');
+        if (has_extra) {
+            try out.writer.writeAll(",\"" ++ tool_extra_field ++ "\":[");
+            for (self.tools.items, 0..) |tool, index| {
+                if (index != 0) try out.writer.writeByte(',');
+                try out.writer.writeAll(tool.extra orelse "null");
+            }
+            try out.writer.writeByte(']');
+        }
+        try out.writer.writeByte('}');
         if (out.written().len > @min(self.limits.reasoning_bytes, types.ProviderReplay.max_bytes)) return error.ReplayTooLarge;
         return try out.toOwnedSlice();
     }
@@ -803,11 +864,19 @@ pub const Reducer = struct {
         if (value.array.items.len != 0 and self.choice == .none) return error.UnexpectedToolCall;
         for (value.array.items, 0..) |item, delta_index| {
             const delta = try object(item);
-            const index = try index_value(delta.get("index") orelse return error.InvalidChunk);
+            // Gemini sends each call whole with no index: the call with its
+            // id, or the next one.
+            const index = if (delta.get("index")) |given| try index_value(given) else if (self.limits.dialect == .gemini) blk: {
+                const id = if (non_null(delta, "id")) |named| try string(named) else return error.InvalidChunk;
+                for (self.tools.items, 0..) |known, known_index| {
+                    if (known.id != null and std.mem.eql(u8, known.id.?, id)) break :blk known_index;
+                }
+                break :blk self.tools.items.len;
+            } else return error.InvalidChunk;
             if (index >= self.limits.tool_calls) return error.TooManyTools;
-            for (value.array.items[0..delta_index]) |prior| {
+            if (delta.get("index") != null) for (value.array.items[0..delta_index]) |prior| {
                 if (try index_value((try object(prior)).get("index") orelse return error.InvalidChunk) == index) return error.ConflictingIdentity;
-            }
+            };
             while (self.tools.items.len <= index) try self.tools.append(self.alloc, .{});
             const tool = &self.tools.items[index];
             if (non_null(delta, "type")) |kind| if (!std.mem.eql(u8, try string(kind), "function")) return error.InvalidChunk;
@@ -823,6 +892,14 @@ pub const Reducer = struct {
                 }
                 if (non_null(function, "arguments")) |arguments| try append_bounded(self.alloc, &tool.arguments, try string(arguments), self.limits.arguments_bytes, error.ArgumentsTooLarge);
             }
+            if (self.limits.dialect == .gemini) if (non_null(delta, "extra_content")) |extra| {
+                if (extra != .object) return error.InvalidChunk;
+                const encoded = try std.json.Stringify.valueAlloc(self.alloc, extra, .{});
+                errdefer self.alloc.free(encoded);
+                try self.count_reasoning(encoded.len + 1);
+                if (tool.extra) |prior| self.alloc.free(prior);
+                tool.extra = encoded;
+            };
         }
     }
 
@@ -852,7 +929,10 @@ pub const Reducer = struct {
         // Carried progress values are lower bounds, not current or final assertions.
         if (total) |tokens| {
             const sum = std.math.add(u64, usage.input_tokens orelse 0, usage.output_tokens orelse 0) catch return error.InvalidChunk;
-            const exact = (incoming.input_tokens != null and incoming.output_tokens != null) or (final_fields.input and final_fields.output);
+            // Gemini counts its thinking in total_tokens and nowhere else, so
+            // its total may exceed the parts, never fall short of them.
+            const exact = self.limits.dialect != .gemini and
+                ((incoming.input_tokens != null and incoming.output_tokens != null) or (final_fields.input and final_fields.output));
             if (incoming_total != null or final_fields.total) {
                 if (tokens < sum or (exact and tokens != sum)) return error.InvalidChunk;
             } else if (exact and sum < tokens) return error.InvalidChunk;
@@ -881,7 +961,8 @@ pub const Reducer = struct {
         if (cancelled) return error.Cancelled;
         if (self.phase == .closed) return error.StreamClosed;
         if (self.phase != .done) return error.IncompleteStream;
-        const reason = self.finish_reason.?;
+        // Gemini ends a turn of tool calls with `stop`.
+        const reason: types.ProviderFinishReason = if (self.limits.dialect == .gemini and self.finish_reason.? == .stop and self.tools.items.len != 0) .tool_calls else self.finish_reason.?;
         switch (reason) {
             .content_filter => return error.ContentFiltered,
             .stop, .tool_calls, .length => {},
@@ -1319,6 +1400,69 @@ test "chat completions replay preserves sequence protected IDs affinity and cano
     try std.testing.expect(request.messages[0].provider_replay.?.parts_json.ptr == replay.parts_json.ptr);
 }
 
+test "gemini dialect: a whole tool call with no index ends on stop, and its signature goes back on that call" {
+    const alloc = std.testing.allocator;
+    const provider = test_provider();
+    // As gemini-4-hydrogen streams it.
+    const call_chunk = "{\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"extra_content\":{\"google\":{\"thought_signature\":\"SIG1\"}},\"function\":{\"arguments\":\"{\\\"path\\\":\\\"x\\\"}\",\"name\":\"read_file\"},\"id\":\"call_58\",\"type\":\"function\"}]},\"index\":0}],\"usage\":{\"completion_tokens\":16,\"prompt_tokens\":90,\"total_tokens\":144}}";
+    const stop_chunk = "{\"choices\":[{\"delta\":{\"role\":\"assistant\"},\"finish_reason\":\"stop\",\"index\":0}],\"usage\":{\"completion_tokens\":22,\"prompt_tokens\":90,\"total_tokens\":150}}";
+
+    var standard = try Reducer.init(alloc, test_tool_request(), .{});
+    defer standard.deinit();
+    try std.testing.expectError(error.InvalidChunk, standard.accept(call_chunk, false));
+
+    var reducer = try Reducer.init(alloc, test_tool_request(), .{ .dialect = .gemini });
+    defer reducer.deinit();
+    try test_accept(&reducer, call_chunk);
+    var result = try test_finish(&reducer, stop_chunk);
+    defer result.deinit(alloc);
+    const completion = result.completed.completion;
+    try std.testing.expectEqual(types.ProviderFinishReason.tool_calls, completion.finish_reason);
+    try std.testing.expectEqual(@as(usize, 1), completion.tool_calls.len);
+    try std.testing.expectEqualStrings("call_58", completion.tool_calls[0].id);
+
+    const replay: types.ProviderReplay = .{ .source = .{ .provider = provider, .model = test_request().model }, .parts_json = completion.provider_state_json.? };
+    var request = test_request();
+    request.messages = &.{
+        .{ .role = .user, .content = "read x" },
+        .{ .role = .assistant, .tool_calls = completion.tool_calls, .provider_replay = replay },
+        .{ .role = .tool, .tool_call_id = completion.tool_calls[0].id, .content = "result" },
+    };
+    const body = try build_request(alloc, request, .{ .provider = &provider });
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const assistant = parsed.value.object.get("messages").?.array.items[3].object;
+    const call = assistant.get("tool_calls").?.array.items[0].object;
+    try std.testing.expectEqualStrings("SIG1", call.get("extra_content").?.object.get("google").?.object.get("thought_signature").?.string);
+    try std.testing.expect(assistant.get(tool_extra_field) == null);
+    try std.testing.expect(assistant.get("extra_content") == null);
+}
+
+test "gemini dialect sends every system message first, as one, in order" {
+    const alloc = std.testing.allocator;
+    var request = test_request();
+    request.instructions = &.{
+        .{ .role = .system, .content = "first" },
+        .{ .role = .system, .content = "second" },
+        .{ .role = .system, .content = "runtime context" },
+        .{ .role = .system, .content = "saved notes" },
+    };
+    const body = try build_request(alloc, request, .{ .dialect = .gemini });
+    defer alloc.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const messages = parsed.value.object.get("messages").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), messages.len);
+    try std.testing.expectEqualStrings("system", messages[0].object.get("role").?.string);
+    try std.testing.expectEqualStrings("first\n\nsecond\n\nruntime context\n\nsaved notes", messages[0].object.get("content").?.string);
+    try std.testing.expectEqualStrings("user", messages[1].object.get("role").?.string);
+
+    const standard = try build_request(alloc, request, .{});
+    defer alloc.free(standard);
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, standard, "\"role\":\"system\""));
+}
+
 test "chat completions projection keeps indivisible reasoning only with all associated calls" {
     const alloc = std.testing.allocator;
     const calls = [_]types.ToolCall{
@@ -1515,6 +1659,27 @@ test "chat completions progress usage can finalize in a trailer but cannot decre
     try test_accept(&totals, test_stop);
     try test_accept(&totals, "{\"choices\":[],\"usage\":{\"total_tokens\":11}}");
     try std.testing.expectError(error.ConflictingIdentity, totals.accept("{\"choices\":[],\"usage\":{\"total_tokens\":12}}", false));
+}
+
+test "a total that also counts hidden thinking is accepted only from a connection that says so" {
+    const alloc = std.testing.allocator;
+    const first = "{\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi there\"}}],\"usage\":{\"prompt_tokens\":67,\"completion_tokens\":5,\"total_tokens\":329}}";
+    var strict = try Reducer.init(alloc, test_request(), .{});
+    defer strict.deinit();
+    try std.testing.expectError(error.InvalidChunk, strict.accept(first, false));
+
+    var reducer = try Reducer.init(alloc, test_request(), .{ .dialect = .gemini });
+    defer reducer.deinit();
+    try test_accept(&reducer, first);
+    try test_accept(&reducer, "{\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"extra_content\":{\"google\":{\"thought_signature\":\"abc\"}}},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":67,\"completion_tokens\":9,\"total_tokens\":333}}");
+    try test_accept(&reducer, "[DONE]");
+    var result = try reducer.finish(false);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(?u64, 9), result.completed.completion.usage.output_tokens);
+    // A total below its parts is still wrong.
+    var low = try Reducer.init(alloc, test_request(), .{ .dialect = .gemini });
+    defer low.deinit();
+    try std.testing.expectError(error.InvalidChunk, low.accept("{\"choices\":[{\"index\":0,\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":12}}", false));
 }
 
 fn test_usage_snapshot(reducer: *Reducer, usage: []const u8) Error!void {

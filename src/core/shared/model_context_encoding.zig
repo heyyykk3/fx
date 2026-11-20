@@ -235,7 +235,9 @@ test "decodeScalarAlloc leaves other ampersands as they are" {
 pub const scoped_rules_tag = "scoped-rules";
 pub const context_update_tag = "fx-context-update";
 pub const skill_used_tag = "fx-skill-used";
-const carried_tags = [_][]const u8{ scoped_rules_tag, context_update_tag, skill_used_tag };
+/// The block of saved memory notes fx adds to a turn's context.
+pub const memory_tag = "fx-memory";
+const carried_tags = [_][]const u8{ scoped_rules_tag, context_update_tag, skill_used_tag, memory_tag };
 /// What a carried tag starts with in text fx escaped.
 const escaped_open = "&lt;";
 

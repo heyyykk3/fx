@@ -77,6 +77,13 @@ pub const Protocol = enum {
 
 pub const ToolChoiceMode = enum { omit, send };
 
+/// A Chat Completions server's known departures from OpenAI's. `gemini`
+/// (Gemini's OpenAI-compatible endpoint): total_tokens also counts thinking,
+/// a streamed tool call may carry no index, `stop` may end a turn of tool
+/// calls, and each call's `extra_content` (its thought signature) must come
+/// back on the next request.
+pub const Dialect = enum { standard, gemini };
+
 /// The Chat Completions field that carries the output limit. Servers differ:
 /// some read only one of the two and ignore the other without an error.
 pub const OutputLimitField = enum { max_tokens, max_completion_tokens };
@@ -153,6 +160,8 @@ pub const Definition = struct {
     /// the settings turn it on, so fx never probes a server on its own
     /// (`tests/tla/configured_provider/ConfiguredCatalog.tla` NoRequestWhenOff).
     fetch_models: bool = false,
+    /// How the server departs from OpenAI's Chat Completions, when it does.
+    dialect: Dialect = .standard,
     /// Metadata for every model on the connection that does not set a field
     /// itself, including one the settings do not declare. Its `id` is empty.
     model_defaults: ?ModelMetadata = null,
@@ -400,7 +409,7 @@ pub const Registry = struct {
 /// `owned` is the registry's arena: a failure frees nothing here.
 fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at: ?*FailurePath) ParseError!Definition {
     try validate_id(id);
-    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "title_model", "vision_model", "headers", "timeouts", "fetch_models", "model_defaults", "model_metadata" }, at);
+    try check_fields(value, &.{ "protocol", "base_url", "auth", "tool_choice_mode", "reviewer_model", "title_model", "vision_model", "headers", "timeouts", "fetch_models", "dialect", "model_defaults", "model_metadata" }, at);
     enter(at, "protocol");
     const protocol_name = try required(value, "protocol");
     if (protocol_name != .string) return error.InvalidProtocol;
@@ -426,6 +435,14 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
         enter(at, "fetch_models");
         if (fetch != .bool) return error.InvalidConnectionOption;
         fetch_models = fetch.bool;
+        leave(at);
+    }
+    var dialect: Dialect = .standard;
+    if (value.object.get("dialect")) |named| {
+        enter(at, "dialect");
+        if (named != .string) return error.InvalidConnectionOption;
+        dialect = std.meta.stringToEnum(Dialect, named.string) orelse return error.InvalidConnectionOption;
+        if (dialect != .standard and protocol != .@"openai-chat-completions") return error.InvalidConnectionOption;
         leave(at);
     }
     const reviewer_model = try optional_model(owned, value, "reviewer_model", at);
@@ -455,6 +472,7 @@ fn parse_definition(owned: Allocator, id: []const u8, value: std.json.Value, at:
         .headers = headers,
         .timeouts = timeouts,
         .fetch_models = fetch_models,
+        .dialect = dialect,
         .model_defaults = model_defaults,
         .model_metadata = model_metadata,
     };
@@ -1046,7 +1064,7 @@ test "configured provider validation failures release earlier definitions and mo
 
 const test_options_json =
     \\{"router":{"protocol":"openai-chat-completions","base_url":"https://example.com/v1","auth":{"type":"bearer","env":"ROUTER_KEY"},
-    \\"title_model":"small/title","vision_model":"small/vision","fetch_models":true,
+    \\"title_model":"small/title","vision_model":"small/vision","fetch_models":true,"dialect":"gemini",
     \\"headers":{"X-Org":{"env":"ROUTER_ORG"},"x-trace":{"env":"_TRACE"}},
     \\"timeouts":{"connect_ms":1,"first_response_ms":600000,"stall_ms":86400000},
     \\"model_defaults":{"context_window":65536,"supports_tool_use":true,"request":{"top_p":0.9},"reasoning_efforts":{"low":{"reasoning_effort":"low"}}},
@@ -1063,6 +1081,7 @@ test "configured provider reads connection options, request fields, and effort l
     try std.testing.expectEqualStrings("small/title", router.title_model.?);
     try std.testing.expectEqualStrings("small/vision", router.vision_model.?);
     try std.testing.expect(router.fetch_models);
+    try std.testing.expectEqual(Dialect.gemini, router.dialect);
     try std.testing.expectEqual(@as(usize, 2), router.headers.len);
     try std.testing.expectEqualStrings("X-Org", router.headers[0].name);
     try std.testing.expectEqualStrings("ROUTER_ORG", router.headers[0].env);
@@ -1181,6 +1200,8 @@ test "configured provider refuses fx's own fields and headers, and malformed opt
         .{ .json = "\"timeouts\":{\"total_ms\":1}", .err = error.UnknownField, .path = "local.timeouts.total_ms" },
         .{ .json = "\"fetch_models\":\"yes\"", .err = error.InvalidConnectionOption, .path = "local.fetch_models" },
         .{ .json = "\"fetch_models\":null", .err = error.InvalidConnectionOption, .path = "local.fetch_models" },
+        .{ .json = "\"dialect\":\"yes\"", .err = error.InvalidConnectionOption, .path = "local.dialect" },
+        .{ .json = "\"dialect\":true", .err = error.InvalidConnectionOption, .path = "local.dialect" },
         .{ .json = "\"title_model\":\"\"", .err = error.InvalidModelId, .path = "local.title_model" },
         .{ .json = "\"vision_model\":7", .err = error.InvalidModelId, .path = "local.vision_model" },
         .{ .json = "\"tool_choice_mode\":\"always\"", .err = error.InvalidToolChoiceMode, .path = "local.tool_choice_mode" },

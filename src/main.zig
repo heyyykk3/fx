@@ -5421,6 +5421,7 @@ test {
     _ = @import("acp/server.zig");
     _ = @import("acp/libfx_hooks.zig");
     _ = @import("acp/types.zig");
+    _ = @import("acp/memory_agent.zig");
     _ = @import("core/mcp_host/model.zig");
     _ = @import("core/output/activity_status.zig");
     _ = @import("core/agent/agent_runtime.zig");
@@ -5653,6 +5654,8 @@ test {
     _ = @import("tools/filesystem/read_file.zig");
     _ = @import("tools/session/read_tool_result.zig");
     _ = @import("tools/skills/install_skill.zig");
+    _ = @import("core/memory/memory.zig");
+    _ = @import("tools/memory/memory.zig");
     _ = @import("tools/skills/skill.zig");
     _ = @import("tools/skills/skill_search.zig");
     _ = @import("tools/capabilities/capability_search.zig");

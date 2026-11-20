@@ -14,6 +14,21 @@ pub const max_bytes: usize = 64 * 1024;
 /// The side file a v1 session keeps the prompt in.
 pub const file_name = "system-prompt.txt";
 const block_separator = "\n\n";
+const replace_sentinel = "<!--fx-system-prompt-mode:replace-->\n";
+
+pub const Mode = enum {
+    append,
+    replace,
+};
+
+pub const Parsed = struct {
+    text: []u8,
+    mode: Mode = .append,
+
+    pub fn deinit(self: Parsed, alloc: Allocator) void {
+        alloc.free(self.text);
+    }
+};
 
 pub const ParseError = Allocator.Error || error{
     InvalidParams,
@@ -32,6 +47,12 @@ pub const ParseError = Allocator.Error || error{
 /// `systemPrompt` is the RFD field. `_meta.fx.systemPrompt` carries the same
 /// content for clients whose SDK drops unknown request fields.
 pub fn parse(alloc: Allocator, params_raw: ?[]const u8) ParseError!?[]u8 {
+    const parsed = (try parseWithMode(alloc, params_raw)) orelse return null;
+    return parsed.text;
+}
+
+/// Returns the owned prompt and mode (append or replace) from session/new params.
+pub fn parseWithMode(alloc: Allocator, params_raw: ?[]const u8) ParseError!?Parsed {
     const raw = params_raw orelse return null;
     const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -46,13 +67,43 @@ pub fn parse(alloc: Allocator, params_raw: ?[]const u8) ParseError!?[]u8 {
     if (standard != null and extension != null) return error.DuplicateSystemPrompt;
     const blocks = standard orelse extension;
 
-    if (params.get("systemPromptMode")) |mode| {
+    var prompt_mode: Mode = .append;
+    const mode_val = params.get("systemPromptMode") orelse acp_types.fxMetaField(params, "systemPromptMode");
+    if (mode_val) |mode| {
         if (blocks == null) return error.SystemPromptModeWithoutPrompt;
-        if (mode != .string or !std.mem.eql(u8, mode.string, "append")) {
+        if (mode != .string) return error.UnsupportedSystemPromptMode;
+        if (std.mem.eql(u8, mode.string, "append")) {
+            prompt_mode = .append;
+        } else if (std.mem.eql(u8, mode.string, "replace")) {
+            prompt_mode = .replace;
+        } else {
             return error.UnsupportedSystemPromptMode;
         }
     }
-    return try joinTextBlocks(alloc, blocks orelse return null);
+    const text = try joinTextBlocks(alloc, blocks orelse return null);
+    return .{ .text = text, .mode = prompt_mode };
+}
+
+/// Encodes prompt text and mode for session persistence without breaking older sessions.
+pub fn encodePersisted(alloc: Allocator, text: []const u8, mode: Mode) Allocator.Error![]u8 {
+    return switch (mode) {
+        .append => alloc.dupe(u8, text),
+        .replace => std.mem.concat(alloc, u8, &.{ replace_sentinel, text }),
+    };
+}
+
+/// Decodes a persisted client prompt string back into owned text and mode.
+pub fn decodePersisted(alloc: Allocator, stored: []const u8) Allocator.Error!Parsed {
+    if (std.mem.startsWith(u8, stored, replace_sentinel)) {
+        return .{
+            .text = try alloc.dupe(u8, stored[replace_sentinel.len..]),
+            .mode = .replace,
+        };
+    }
+    return .{
+        .text = try alloc.dupe(u8, stored),
+        .mode = .append,
+    };
 }
 
 pub fn parseErrorMessage(err: ParseError) []const u8 {
@@ -67,7 +118,7 @@ pub fn parseErrorMessage(err: ParseError) []const u8 {
         error.InvalidSystemPromptText => "systemPrompt text must be valid UTF-8 without NUL bytes",
         error.DuplicateSystemPrompt => "Send systemPrompt or _meta.fx.systemPrompt, not both",
         error.SystemPromptModeWithoutPrompt => "systemPromptMode requires systemPrompt",
-        error.UnsupportedSystemPromptMode => "systemPromptMode supports only \"append\"",
+        error.UnsupportedSystemPromptMode => "systemPromptMode supports \"append\" or \"replace\"",
     };
 }
 
@@ -154,6 +205,20 @@ test "client system prompt parses RFD text blocks in append mode" {
     )).?;
     defer alloc.free(meta);
     try std.testing.expectEqualStrings("From meta.", meta);
+
+    const replaced = (try parseWithMode(alloc,
+        \\{"systemPrompt":[{"type":"text","text":"Full host prompt."}],"systemPromptMode":"replace"}
+    )).?;
+    defer replaced.deinit(alloc);
+    try std.testing.expectEqual(Mode.replace, replaced.mode);
+    try std.testing.expectEqualStrings("Full host prompt.", replaced.text);
+
+    const encoded = try encodePersisted(alloc, replaced.text, replaced.mode);
+    defer alloc.free(encoded);
+    const decoded = try decodePersisted(alloc, encoded);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqual(Mode.replace, decoded.mode);
+    try std.testing.expectEqualStrings("Full host prompt.", decoded.text);
 
     try std.testing.expect((try parse(alloc, "{\"cwd\":\"/tmp\"}")) == null);
 }

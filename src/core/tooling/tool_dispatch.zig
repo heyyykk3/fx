@@ -318,6 +318,7 @@ pub const DispatchContext = struct {
     mcp_access_changed: ?tool_mcp_runtime.AccessChangedFn = null,
     mcp_input_responder: ?tool_mcp_runtime.InputResponder = null,
     mcp_call_options: tool_mcp_runtime.CallOptions = .{},
+    memory_agent_name: []const u8 = "main",
     mcp_call_status_sink: ?*?tool_mcp_runtime.CallStatus = null,
     mcp_execution_error_sink: ?*?anyerror = null,
     /// Lent to `fx mcp call` while this tool call runs; see
@@ -410,6 +411,7 @@ pub const LabelArgKind = enum {
     open,
     run,
     search,
+    content,
 };
 
 pub const PermissionTargetKind = core_permissions.PermissionTargetKind;
@@ -431,6 +433,7 @@ pub const ExecutorKind = enum {
     vision,
     host,
     toolbox,
+    memory,
     /// An MCP tool from a server, registered while it is sent or run.
     mcp_tool,
 };
@@ -717,6 +720,7 @@ fn labelValueForKind(kind: LabelArgKind, args: std.json.ObjectMap) ?[]const u8 {
         .open => if (optionalStringArg(args, "open")) |value| openLabel(value) else null,
         .run => optionalStringArg(args, "run"),
         .search => optionalStringArg(args, "search"),
+        .content => optionalStringArg(args, "content"),
     };
 }
 
